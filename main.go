@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/mem"
@@ -25,17 +28,40 @@ type Dependency struct {
 	IssueLink   string // Link to related GitHub issue
 }
 
+type Config struct {
+	Verbose    bool
+	JSON       bool
+	Categories []string
+	Timeout    time.Duration
+	OutputFile string
+}
+
+var config Config
+
 func main() {
 	rootCmd := &cobra.Command{
 		Use:   "fyne-doctor",
 		Short: "Fyne Environment Check Tool",
+		Long: `Fyne Doctor is a comprehensive tool for checking your Fyne development environment.
+It detects dependencies, identifies common issues, and provides installation guidance
+based on the latest Fyne GitHub Issues and documentation.`,
 	}
 
 	doctorCmd := &cobra.Command{
 		Use:   "doctor",
 		Short: "Check Fyne development environment",
-		Run:   runDoctor,
+		Long: `Run a comprehensive check of your Fyne development environment.
+This includes checking for required dependencies, detecting common issues,
+and providing platform-specific installation guidance.`,
+		Run: runDoctor,
 	}
+
+	// Add flags
+	doctorCmd.Flags().BoolVarP(&config.Verbose, "verbose", "v", false, "Enable verbose output")
+	doctorCmd.Flags().BoolVarP(&config.JSON, "json", "j", false, "Output results in JSON format")
+	doctorCmd.Flags().StringSliceVarP(&config.Categories, "categories", "c", []string{}, "Filter by categories (core,mobile,web,performance,compatibility)")
+	doctorCmd.Flags().DurationVarP(&config.Timeout, "timeout", "t", 10*time.Second, "Command execution timeout")
+	doctorCmd.Flags().StringVarP(&config.OutputFile, "output", "o", "", "Save output to file")
 
 	rootCmd.AddCommand(doctorCmd)
 	if err := rootCmd.Execute(); err != nil {
@@ -139,6 +165,16 @@ func getDependencies() []Dependency {
 			Platform:    "all",
 			Category:    "core",
 			Severity:    "info",
+		},
+		{
+			Name:        "Fyne Setup",
+			Command:     "setup --version || echo 'Not installed'",
+			Optional:    true,
+			Description: "Official Fyne environment setup tool (GUI)",
+			Platform:    "all",
+			Category:    "core",
+			Severity:    "info",
+			IssueLink:   "https://github.com/fyne-io/setup",
 		},
 	}
 
@@ -324,6 +360,29 @@ func getDependencies() []Dependency {
 	return baseDeps
 }
 
+// executeCommandWithTimeout executes a command with a timeout
+func executeCommandWithTimeout(cmd string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var c *exec.Cmd
+	if runtime.GOOS == "windows" {
+		c = exec.CommandContext(ctx, "cmd", "/C", cmd)
+	} else {
+		c = exec.CommandContext(ctx, "sh", "-c", cmd)
+	}
+
+	out, err := c.CombinedOutput()
+	if err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return "", fmt.Errorf("command timed out after %v", timeout)
+		}
+		return "", err
+	}
+
+	return strings.TrimSpace(string(out)), nil
+}
+
 func checkDependency(cmd string) (status string, version string) {
 	// Handle environment variable checks
 	if strings.HasPrefix(cmd, "echo $") {
@@ -337,12 +396,9 @@ func checkDependency(cmd string) (status string, version string) {
 
 	// Handle pkg-config checks
 	if strings.Contains(cmd, "pkg-config --exists") {
-		c := exec.Command("sh", "-c", cmd)
-		if runtime.GOOS == "windows" {
-			c = exec.Command("cmd", "/C", cmd)
-		}
-		err := c.Run()
+		_, err := executeCommandWithTimeout(cmd, 5*time.Second)
 		if err != nil {
+			log.Printf("Warning: pkg-config check failed for '%s': %v", cmd, err)
 			return "Missing", ""
 		}
 		return "Installed", "Found"
@@ -350,12 +406,9 @@ func checkDependency(cmd string) (status string, version string) {
 
 	// Handle which command checks
 	if strings.HasPrefix(cmd, "which ") {
-		c := exec.Command("sh", "-c", cmd)
-		if runtime.GOOS == "windows" {
-			c = exec.Command("cmd", "/C", cmd)
-		}
-		err := c.Run()
+		_, err := executeCommandWithTimeout(cmd, 5*time.Second)
 		if err != nil {
+			log.Printf("Warning: which command failed for '%s': %v", cmd, err)
 			return "Missing", ""
 		}
 		return "Installed", "Found"
@@ -363,15 +416,11 @@ func checkDependency(cmd string) (status string, version string) {
 
 	// Handle complex command chains
 	if strings.Contains(cmd, "||") || strings.Contains(cmd, "&&") {
-		c := exec.Command("sh", "-c", cmd)
-		if runtime.GOOS == "windows" {
-			c = exec.Command("cmd", "/C", cmd)
-		}
-		out, err := c.CombinedOutput()
+		result, err := executeCommandWithTimeout(cmd, 10*time.Second)
 		if err != nil {
+			log.Printf("Warning: complex command failed for '%s': %v", cmd, err)
 			return "Error", ""
 		}
-		result := strings.TrimSpace(string(out))
 		if result == "" {
 			return "Missing", ""
 		}
@@ -383,15 +432,13 @@ func checkDependency(cmd string) (status string, version string) {
 	if _, err := exec.LookPath(firstCmd); err != nil {
 		return "Missing", ""
 	}
-	c := exec.Command("sh", "-c", cmd)
-	if runtime.GOOS == "windows" {
-		c = exec.Command("cmd", "/C", cmd)
-	}
-	out, err := c.CombinedOutput()
+
+	result, err := executeCommandWithTimeout(cmd, 10*time.Second)
 	if err != nil {
+		log.Printf("Warning: command execution failed for '%s': %v", cmd, err)
 		return "Error", ""
 	}
-	return "Installed", strings.TrimSpace(string(out))
+	return "Installed", result
 }
 
 func printDependencyTable(deps []Dependency) {
@@ -500,6 +547,10 @@ func printInstallationTips() {
 	fmt.Println()
 	fmt.Println("For cross-platform builds:")
 	fmt.Println("  go install github.com/fyne-io/fyne-cross@latest")
+	fmt.Println()
+	fmt.Println("For GUI environment setup:")
+	fmt.Println("  go install fyne.io/setup@latest")
+	fmt.Println("  $(go env GOPATH)/bin/setup")
 }
 
 // checkCommonIssues checks for common problems based on GitHub Issues
